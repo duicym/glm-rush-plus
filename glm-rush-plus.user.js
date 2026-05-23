@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 Plus
 // @namespace    https://github.com/duicym/glm-rush-plus
-// @version      1.0.3
+// @version      1.0.4
 // @description  自动捕获真实API参数 + 补全智谱自定义Headers (bigmodel-org/project) + WAF检测 + 极速并发
 // @author       duicym
 // @homepage     https://github.com/duicym/glm-rush-plus
@@ -953,6 +953,29 @@
         return null;
     }
 
+    // 检测腾讯云验证码弹窗
+    function isCaptchaVisible() {
+        // 腾讯云 TCaptcha 的特征 DOM
+        const selectors = [
+            '#TCaptcha',                          // 腾讯云验证码主容器
+            '.tcaptcha',                         // class 形式
+            'iframe[src*="turing.captcha"]',    // 验证码 iframe
+            'iframe[src*="captcha"]',            // 通用 captcha iframe
+            '[id*="captcha"]',                   // id 含 captcha 的元素
+            '[class*="captcha"]',                // class 含 captcha 的元素
+        ];
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el && el.offsetParent !== null) {
+                const s = window.getComputedStyle(el);
+                if (s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0') return true;
+            }
+        }
+        // 也检查页面是否出现"请完成验证"之类的文字
+        if (/请完成验证|验证失败|滑块验证|点选验证/i.test(document.body?.textContent || '')) return true;
+        return false;
+    }
+
     async function startProactive() {
         if (!state.captured) {
             log('无捕获参数, 尝试自动捕获...');
@@ -968,8 +991,41 @@
             log('已经抢到了, 不重复抢购');
             return;
         }
+
+        // 第一阶段：点击购买按钮，处理验证码
+        log('第1步: 点击购买按钮 (可能触发验证码)...');
+        let buyBtn = findBuyButton();
+        if (buyBtn && buyBtn.offsetParent !== null) {
+            log('找到购买按钮，点击中...');
+            buyBtn.click();
+            // 等待验证码弹窗
+            await sleep(2000);
+
+            if (isCaptchaVisible()) {
+                log('⚠️ 验证码已弹出! 请手动完成验证，然后点「我已通过验证码，继续」', 'error');
+                setState({ captchaNeeded: true });
+                try { new Notification('GLM抢购助手', { body: '请完成验证码！' }); } catch {}
+
+                // 等待用户确认已通过验证码
+                log('等待验证码完成...（最多等5分钟）');
+                let waitStart = Date.now();
+                while (state.captchaNeeded && !stopRequested && (Date.now() - waitStart) < 300000) {
+                    await sleep(1000);
+                    // 每10秒检查一次验证码是否还在
+                    if (!isCaptchaVisible() && !state.captchaNeeded) break;
+                }
+                if (stopRequested) { log('用户中止'); return; }
+                log('✅ 验证码已确认，继续抢购...');
+            } else {
+                log('未检测到验证码弹窗，可能已提前验证');
+            }
+        } else {
+            log('未找到购买按钮，直接发请求');
+        }
+
+        // 第二阶段：正式抢购
         setState({ proactive: true });
-        log('极速抢购启动! 前' + CFG.turboSec + '秒' + CFG.turboConcurrency + '路并发, 之后' + CFG.concurrency + '路');
+        log('第2步: 极速抢购启动! 前' + CFG.turboSec + '秒' + CFG.turboConcurrency + '路并发, 之后' + CFG.concurrency + '路');
 
         const { url, method, body } = state.captured;
         const result = await retry(url, { method, body, headers: state.captured?.headers || {} });
