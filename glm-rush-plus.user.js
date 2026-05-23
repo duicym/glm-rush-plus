@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 Plus
 // @namespace    https://github.com/duicym/glm-rush-plus
-// @version      1.0.2
+// @version      1.0.3
 // @description  自动捕获真实API参数 + 补全智谱自定义Headers (bigmodel-org/project) + WAF检测 + 极速并发
 // @author       duicym
 // @homepage     https://github.com/duicym/glm-rush-plus
@@ -22,18 +22,18 @@
     const DEFAULT_CFG = {
         targetPlan: 'max',     // 目标套餐: lite / pro / max
         productIdOverride: null, // 如果指定了 productId，直接用它，否则自动从页面提取
-        concurrency: 5,
-        turboConcurrency: 10,
+        concurrency: 3,         // 常规并发数（降低避免WAF封禁）
+        turboConcurrency: 4,    // 抢购前N秒的并发数（降低避免WAF封禁）
         turboSec: 5,
         maxRetry: 2000,
-        burstCount: 20,
-        fastDelay: 30,
-        slowDelay: 100,
-        jitter: 0.3,
+        burstCount: 10,          // 前N次请求无延迟（降低）
+        fastDelay: 80,           // 快速阶段延迟 ms（增加）
+        slowDelay: 200,           // 慢速阶段延迟 ms（增加）
+        jitter: 0.5,             // 随机抖动系数（提高随机性）
         recoveryMax: 3,
         logMax: 100,
         rushTime: '10:00:00',
-        autoCapture: true,    // 自动从页面提取参数（无需手动点击）
+        autoCapture: true,
         PREVIEW: '/api/biz/pay/preview',
         CHECK: '/api/biz/pay/check',
     };
@@ -66,6 +66,7 @@
         timerId: null,
         logs: [],
         stats: { total: 0, success: 0, errors: 0, avgMs: 0, startTime: 0 },
+        captchaNeeded: false,   // 是否需要人工完成验证码
     };
 
     function setState(patch) {
@@ -466,10 +467,20 @@
                 const m = document.cookie.match(/bigmodel_project=([^;]+)/);
                 if (m) randHeaders['bigmodel-project'] = decodeURIComponent(m[1]);
             }
-            randHeaders['X-Request-Id'] = Math.random().toString(36).slice(2, 15);
-            randHeaders['X-Timestamp'] = String(Date.now());
-            const q = (0.5 + Math.random() * 0.5).toFixed(1);
-            randHeaders['Accept-Language'] = 'zh-CN,zh;q=' + q + ',en;q=' + (q * 0.7).toFixed(1);
+
+            // 补全更真实的浏览器 headers（降低WAF识别风险）
+            randHeaders['Accept'] = 'application/json, text/plain, */*';
+            randHeaders['Accept-Language'] = 'zh-CN,zh;q=0.9,en;q=0.8';  // 修正拼写
+            randHeaders['Accept-Encoding'] = 'gzip, deflate, br';
+            randHeaders['Cache-Control'] = 'no-cache';
+            randHeaders['Pragma'] = 'no-cache';
+            randHeaders['Sec-Fetch-Dest'] = 'empty';
+            randHeaders['Sec-Fetch-Mode'] = 'cors';
+            randHeaders['Sec-Fetch-Site'] = 'same-origin';
+
+            // 随机去掉一些 headers 让请求更自然
+            if (Math.random() < 0.3) delete randHeaders['X-Request-Id'];
+            if (Math.random() < 0.2) delete randHeaders['X-Timestamp'];
 
             const resp = await _fetch(url, { ...opts, headers: randHeaders, credentials: 'include' });
 
@@ -515,6 +526,20 @@
                 : data.code === 1001 ? '缺少Auth(1001)'
                 : data.code === 555 ? '系统繁忙'
                 : (data.data && data.data.bizId === null) ? '售罄'
+                : data.code === 500 ? (() => {
+                    // 检测验证码相关 500 错误
+                    const msg = (data.msg || data.message || '').toLowerCase();
+                    if (msg.includes('验证码') || msg.includes('ticket') || msg.includes('验证')) {
+                        // 设置需要验证码标志，通知用户
+                        if (!state.captchaNeeded) {
+                            setState({ captchaNeeded: true });
+                            log('⚠️ 需要完成验证码! 请手动完成页面上的验证，然后点击「我已通过验证码，继续」', 'error');
+                            try { new Notification('GLM抢购助手', { body: '需要完成验证码，请手动处理！' }); } catch {}
+                        }
+                        return '验证码 required';
+                    }
+                    return 'code=500';
+                })()
                 : 'code=' + data.code;
             return { ok: false, reason, attempt: attemptNum };
         } catch (e) {
@@ -541,6 +566,21 @@
             let consecutiveSoldOut = 0;
 
             while (totalAttempt < CFG.maxRetry && !stopRequested) {
+
+                // 验证码等待循环：暂停并发，直到用户标记已通过验证
+                if (state.captchaNeeded) {
+                    log('⏸️ 暂停抢购，等待验证码完成...', 'warn');
+                    while (state.captchaNeeded && !stopRequested) {
+                        await sleep(3000);
+                        // 用户点击「我已通过验证码」后会把 captchaNeeded 设为 false
+                    }
+                    if (stopRequested) break;
+                    log('✅ 验证码已确认，继续抢购!', 'info');
+                    // 重置错误计数，重新开始
+                    consecutiveErrors = 0;
+                    throttleCount = 0;
+                }
+
                 const elapsedMs = performance.now() - state.stats.startTime;
                 const isTurbo = elapsedMs < CFG.turboSec * 1000;
                 const curConcurrency = isTurbo ? CFG.turboConcurrency : CFG.concurrency;
@@ -1165,6 +1205,8 @@
 .b-stop{background:#d63031}
 .b-heat{background:#fdcb6e;color:#2d3436}
 .b-capture{background:#00b894;flex:0 0 auto!important;padding:4px 10px!important}
+.b-captcha{background:#e17055;flex:1;padding:8px;border:none;border-radius:6px;cursor:pointer;font-weight:700;font-size:13px;color:#fff;transition:opacity .2s;display:none}
+.b-captcha:hover{opacity:.85}
 .b-time{background:#6c5ce7;flex:0 0 auto!important;padding:4px 10px!important}
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px;font-size:11px;text-align:center}
 .stats div{background:#2d3436;border-radius:4px;padding:4px}
@@ -1202,6 +1244,9 @@
       <button class="b-heat" id="b-heat">预热</button>
       <button class="b-capture" id="b-capture" title="手动重新捕获参数">🔄</button>
     </div>
+    <div class="btns" id="captcha-row" style="display:none;margin-top:6px">
+      <button class="b-captcha" id="b-captcha">✅ 我已通过验证码，继续抢购</button>
+    </div>
     <div class="logs" id="logs"></div>
     <div class="keys">Alt+S 抢购 | Alt+X 停止 | Alt+H 隐藏</div>
   </div>
@@ -1213,7 +1258,11 @@
         $('b-go').onclick = startProactive;
         $('b-stop').onclick = stopAll;
         $('b-heat').onclick = preheat;
-        $('b-capture').onclick = () => { setState({ captured: null }); sessionStorage.removeItem('glm_rush_plus_captured'); autoCaptureParams(); };
+        $('b-capture').onclick = () => { setState({ captured: null, captchaNeeded: false }); sessionStorage.removeItem('glm_rush_plus_captured'); autoCaptureParams(); };
+        $('b-captcha').onclick = () => {
+            log('✅ 用户确认已通过验证码，继续抢购...');
+            setState({ captchaNeeded: false });
+        };
         $('b-time').onclick = () => { const v = $('i-time').value; if (v) { CFG.rushTime = v; saveCfg(CFG); scheduleAt(v); } };
         $('i-conc').onchange = function() { CFG.concurrency = Math.max(1, +this.value || 5); saveCfg(CFG); };
         $('i-turbo').onchange = function() { CFG.turboConcurrency = Math.max(1, +this.value || 10); saveCfg(CFG); };
@@ -1300,6 +1349,12 @@
             if (goBtn && stopBtn) {
                 goBtn.style.display = state.status === 'retrying' ? 'none' : '';
                 stopBtn.style.display = state.status === 'retrying' ? '' : 'none';
+            }
+
+            // 验证码按钮：captchaNeeded=true 时显示
+            const captchaRow = $('captcha-row');
+            if (captchaRow) {
+                captchaRow.style.display = state.captchaNeeded ? '' : 'none';
             }
         });
     }
