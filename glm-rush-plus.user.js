@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 Plus
 // @namespace    https://github.com/duicym/glm-rush-plus
-// @version      1.0.0
-// @description  自动捕获真实API参数（绕过Vue disabled强制触发购买按钮） + 极速并发重试 + 反检测 + 弹窗恢复 + 定时触发
+// @version      1.0.1
+// @description  自动捕获真实API参数（绕过Vue disabled强制触发购买按钮） + 极速并发重试 + 自动注入Authorization + WAF检测 + 反检测 + 弹窗恢复 + 定时触发
 // @author       duicym
 // @homepage     https://github.com/duicym/glm-rush-plus
 // @supportURL   https://github.com/duicym/glm-rush-plus/issues
@@ -313,11 +313,14 @@
             if (!state.captured) {
                 // 拦截器没捕获到，手动设置回退参数
                 log('拦截器未触发, 手动设置捕获参数');
+                const token = getAuthToken();
+                const hdrs = { 'Content-Type': 'application/json' };
+                if (token) hdrs['Authorization'] = 'Bearer ' + token;
                 const captured = {
                     url: url,
                     method: 'POST',
                     body: body,
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: hdrs,
                     productId: maxId,
                     productName: 'Max',
                 };
@@ -362,9 +365,73 @@
     const _fetch = window.fetch;
     let _retryLock = null;
 
+    // 从页面提取 auth token（多来源回退）
+    function getAuthToken() {
+        // 1. 已捕获的 headers 中提取
+        if (state.captured && state.captured.headers) {
+            const h = state.captured.headers;
+            if (h['Authorization']) return h['Authorization'].replace('Bearer ', '');
+            if (h['authorization']) return h['authorization'].replace('Bearer ', '');
+        }
+        // 2. 从 localStorage 提取 (Coding Plan 页面用户数据)
+        try {
+            const keys = ['user', 'currentUser', 'userInfo', 'token', 'accessToken', 'access_token', 'auth'];
+            for (const k of keys) {
+                const raw = localStorage.getItem(k);
+                if (!raw) continue;
+                try {
+                    const j = JSON.parse(raw);
+                    const t = j.token || j.accessToken || j.access_token || j.jwt || j.authorization;
+                    if (t && t.length > 20) return t.replace('Bearer ', '');
+                } catch {
+                    if (raw.length > 30 && raw.length < 500) return raw.replace('Bearer ', '');
+                }
+            }
+        } catch {}
+        // 3. 从 cookie 提取
+        try {
+            const cookies = document.cookie.split(';');
+            for (const c of cookies) {
+                const [k, v] = c.trim().split('=');
+                if (!k || !v) continue;
+                if (/token|auth|jwt|session|passport/i.test(k) && v.length > 20) return v;
+            }
+        } catch {}
+        // 4. 从 Vuex Store 提取
+        try {
+            const app = document.querySelector('#app');
+            if (app && app.__vue__) {
+                let found = null;
+                function dig(vm, d) {
+                    if (d > 12 || found) return;
+                    const store = vm.$store || vm.store;
+                    if (store && store.state) {
+                        for (const mod of ['User', 'Login', 'Auth', 'user', 'login', 'auth']) {
+                            const m = store.state[mod];
+                            if (!m) continue;
+                            for (const key of Object.keys(m)) {
+                                const v = m[key];
+                                if (typeof v === 'string' && v.length > 30) { found = v.replace('Bearer ', ''); return; }
+                            }
+                        }
+                    }
+                    for (const c of (vm.$children || [])) dig(c, d + 1);
+                }
+                dig(app.__vue__, 0);
+                if (found) return found;
+            }
+        } catch {}
+        return '';
+    }
+
     async function singleAttempt(url, opts, attemptNum) {
         try {
+            // 确保 Authorization header 存在
+            const authToken = getAuthToken();
             const randHeaders = { ...opts.headers };
+            if (authToken && !randHeaders['Authorization'] && !randHeaders['authorization']) {
+                randHeaders['Authorization'] = 'Bearer ' + authToken;
+            }
             randHeaders['X-Request-Id'] = Math.random().toString(36).slice(2, 15);
             randHeaders['X-Timestamp'] = String(Date.now());
             const q = (0.5 + Math.random() * 0.5).toFixed(1);
@@ -374,6 +441,12 @@
 
             if (resp.status === 401 || resp.status === 403) {
                 return { ok: false, reason: 'HTTP ' + resp.status + ' 会话过期', attempt: attemptNum };
+            }
+            if (resp.status === 405) {
+                // WAF 封禁 — 立即停止全部重试
+                log('WAF 封禁! (405), 立即停止避免 IP 被封', 'error');
+                stopRequested = true;
+                return { ok: false, reason: 'WAF封禁(405)', attempt: attemptNum };
             }
             if (resp.status === 429) {
                 return { ok: false, reason: '429 限流', attempt: attemptNum };
@@ -405,6 +478,7 @@
             }
 
             const reason = !data ? '非JSON'
+                : data.code === 1001 ? '缺少Auth(1001)'
                 : data.code === 555 ? '系统繁忙'
                 : (data.data && data.data.bizId === null) ? '售罄'
                 : 'code=' + data.code;
@@ -490,6 +564,13 @@
                     log('网络异常, 暂停3秒...');
                     await sleep(3000);
                     consecutiveErrors = 0;
+                }
+
+                // 连续 1001 (缺少Authorization) → 立即停止
+                if (reasons.filter(r => r === '缺少Auth(1001)').length === batchSize && totalAttempt >= 10) {
+                    log('连续缺少Authorization, 可能token失效, 停止重试', 'error');
+                    setState({ status: 'failed' });
+                    return { ok: false };
                 }
 
                 if (reasons.some(r => r.includes('会话过期'))) {
