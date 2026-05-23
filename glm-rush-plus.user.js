@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 Plus
 // @namespace    https://github.com/duicym/glm-rush-plus
-// @version      1.0.1
-// @description  自动捕获真实API参数（绕过Vue disabled强制触发购买按钮） + 极速并发重试 + 自动注入Authorization + WAF检测 + 反检测 + 弹窗恢复 + 定时触发
+// @version      1.0.2
+// @description  自动捕获真实API参数 + 补全智谱自定义Headers (bigmodel-org/project) + WAF检测 + 极速并发
 // @author       duicym
 // @homepage     https://github.com/duicym/glm-rush-plus
 // @supportURL   https://github.com/duicym/glm-rush-plus/issues
@@ -424,13 +424,47 @@
         return '';
     }
 
+    // 从捕获的 headers 中补全智谱自定义 headers（页面 HTTP client 自动加的）
+    function enrichHeaders(headers) {
+        const h = { ...headers };
+        // 1. authorization/Authorization 统一处理
+        const authVal = h['authorization'] || h['Authorization'] || '';
+        if (authVal) {
+            // 确保两种写法都有
+            h['Authorization'] = authVal.startsWith('Bearer ') ? authVal : 'Bearer ' + authVal;
+            h['authorization'] = h['Authorization'];
+        }
+        // 2. 补全智谱自定义 headers（从捕获的 headers 里取，没捕获到就从 cookie 里解析）
+        const CUSTOM_KEYS = ['bigmodel-organization', 'bigmodel-project', 'bigmodel-customer', 'bigmodel-user'];
+        for (const k of CUSTOM_KEYS) {
+            if (!h[k] && !h[k.toLowerCase()]) {
+                // 尝试从捕获的 headers 里找（大小写不敏感）
+                const found = Object.entries(h).find(([kk]) => kk.toLowerCase() === k.toLowerCase());
+                if (found) h[k] = found[1];
+            }
+        }
+        // 3. 确保 credentials 相关的 cookie 会被发送（credentials: 'include' 在 fetch 参数里）
+        return h;
+    }
+
     async function singleAttempt(url, opts, attemptNum) {
         try {
-            // 确保 Authorization header 存在
+            // 用捕获的完整 headers 作为基础，再补随机头
+            const baseHeaders = enrichHeaders(opts.headers || {});
             const authToken = getAuthToken();
-            const randHeaders = { ...opts.headers };
+            const randHeaders = { ...baseHeaders };
             if (authToken && !randHeaders['Authorization'] && !randHeaders['authorization']) {
                 randHeaders['Authorization'] = 'Bearer ' + authToken;
+                randHeaders['authorization'] = randHeaders['Authorization'];
+            }
+            // 补智谱自定义 headers（如果捕获时没拿到，尝试从 cookie 解析）
+            if (!randHeaders['bigmodel-organization']) {
+                const m = document.cookie.match(/bigmodel_organization=([^;]+)/);
+                if (m) randHeaders['bigmodel-organization'] = decodeURIComponent(m[1]);
+            }
+            if (!randHeaders['bigmodel-project']) {
+                const m = document.cookie.match(/bigmodel_project=([^;]+)/);
+                if (m) randHeaders['bigmodel-project'] = decodeURIComponent(m[1]);
             }
             randHeaders['X-Request-Id'] = Math.random().toString(36).slice(2, 15);
             randHeaders['X-Timestamp'] = String(Date.now());
@@ -518,7 +552,7 @@
                     totalAttempt++;
                     const ac = new AbortController();
                     controllers.push(ac);
-                    promises.push(singleAttempt(url, { ...opts, signal: ac.signal }, totalAttempt));
+                    promises.push(singleAttempt(url, { ...opts, headers: state.captured?.headers || opts.headers, signal: ac.signal }, totalAttempt));
                 }
 
                 setState({ count: totalAttempt });
@@ -897,8 +931,8 @@
         setState({ proactive: true });
         log('极速抢购启动! 前' + CFG.turboSec + '秒' + CFG.turboConcurrency + '路并发, 之后' + CFG.concurrency + '路');
 
-        const { url, method, body, headers } = state.captured;
-        const result = await retry(url, { method, body, headers });
+        const { url, method, body } = state.captured;
+        const result = await retry(url, { method, body, headers: state.captured?.headers || {} });
         setState({ proactive: false });
 
         if (result.ok) {
