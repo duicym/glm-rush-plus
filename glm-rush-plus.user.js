@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 Plus
 // @namespace    https://github.com/duicym/glm-rush-plus
-// @version      1.0.6
+// @version      1.0.7
 // @description  自动捕获真实API参数 + 补全智谱自定义Headers (bigmodel-org/project) + WAF检测 + 极速并发
 // @author       duicym
 // @homepage     https://github.com/duicym/glm-rush-plus
@@ -985,24 +985,40 @@
 
     // 检测腾讯云验证码弹窗
     function isCaptchaVisible() {
-        // 腾讯云 TCaptcha 的特征 DOM
+        // 腾讯云 TCaptcha 的特征 DOM（精准匹配，避免误报）
         const selectors = [
             '#TCaptcha',                          // 腾讯云验证码主容器
             '.tcaptcha',                         // class 形式
-            'iframe[src*="turing.captcha"]',    // 验证码 iframe
-            'iframe[src*="captcha"]',            // 通用 captcha iframe
-            '[id*="captcha"]',                   // id 含 captcha 的元素
-            '[class*="captcha"]',                // class 含 captcha 的元素
+            'iframe[src*="turing.captcha"]',    // 腾讯云验证码 iframe
+            'iframe[src*="captcha.qq.com"]',    // 腾讯 captcha 域名
+            'iframe[src*="verify.qq.com"]',     // 腾讯验证域名
+            '[class*="tcaptcha"]',              // tcaptcha 前缀 class
+            '[id*="tCaptcha"]',                 // tCaptcha 前缀 id
         ];
         for (const sel of selectors) {
             const el = document.querySelector(sel);
-            if (el && el.offsetParent !== null) {
-                const s = window.getComputedStyle(el);
-                if (s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0') return true;
+            if (!el) continue;
+            // 元素必须可见且有足够尺寸（验证码弹窗通常 >100x100）
+            const rect = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            if (rect.width > 100 && rect.height > 100 &&
+                s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' &&
+                el.offsetParent !== null) {
+                return true;
             }
         }
-        // 也检查页面是否出现"请完成验证"之类的文字
-        if (/请完成验证|验证失败|滑块验证|点选验证/i.test(document.body?.textContent || '')) return true;
+        // 文字检测：只在固定弹窗/遮罩层内检查（避免全页面误报）
+        const dialogSelectors = ['.el-dialog', '.ant-modal', '.dialog', '.modal', '[class*="overlay"]', '[class*="mask"]', '[class*="popup"]'];
+        for (const sel of dialogSelectors) {
+            const el = document.querySelector(sel);
+            if (!el) continue;
+            const s = window.getComputedStyle(el);
+            if (s.display === 'none' || s.visibility === 'hidden') continue;
+            const text = el.textContent || '';
+            if (/请完成安全验证|请完成人机验证|请完成验证码|滑块验证|点选验证|验证失败|安全校验/i.test(text)) {
+                return true;
+            }
+        }
         return false;
     }
 
@@ -1031,10 +1047,13 @@
         if (buyBtn) {
             log('找到购买按钮: "' + buyBtn.textContent.trim() + '"，强制点击中...');
             forceClickButton(buyBtn);  // 用 forceClick 解除 disabled，绕过"人数过多"锁定
-            // 等待验证码弹窗
+            // 等待验证码弹窗或请求捕获
             await sleep(2000);
 
-            if (isCaptchaVisible()) {
+            // 如果点击后已经捕获到了请求，说明不需要验证码，直接进入第2阶段
+            if (state.captured) {
+                log('✅ 点击后直接捕获到请求，无需验证码，直接进入抢购！');
+            } else if (isCaptchaVisible()) {
                 log('⚠️ 验证码已弹出! 请手动完成验证，然后点「我已通过验证码，继续」', 'error');
                 setState({ captchaNeeded: true });
                 try { new Notification('GLM抢购助手', { body: '请完成验证码！' }); } catch {}
@@ -1042,10 +1061,18 @@
                 // 等待用户确认已通过验证码
                 log('等待验证码完成...（最多等5分钟）');
                 let waitStart = Date.now();
+                let captchaCheckCount = 0;
                 while (state.captchaNeeded && !stopRequested && (Date.now() - waitStart) < 300000) {
                     await sleep(1000);
-                    // 每10秒检查一次验证码是否还在
-                    if (!isCaptchaVisible() && !state.captchaNeeded) break;
+                    captchaCheckCount++;
+                    // 每5秒检查一次验证码是否还在，如果连续3次检测不到则自动解除（可能是误报）
+                    if (captchaCheckCount % 5 === 0) {
+                        if (!isCaptchaVisible()) {
+                            log('验证码弹窗已消失，自动继续...');
+                            setState({ captchaNeeded: false });
+                            break;
+                        }
+                    }
                 }
                 if (stopRequested) { log('用户中止'); return; }
                 log('✅ 验证码已确认，继续抢购...');
