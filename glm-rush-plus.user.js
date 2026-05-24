@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 Plus
 // @namespace    https://github.com/duicym/glm-rush-plus
-// @version      1.0.4
+// @version      1.0.5
 // @description  自动捕获真实API参数 + 补全智谱自定义Headers (bigmodel-org/project) + WAF检测 + 极速并发
 // @author       duicym
 // @homepage     https://github.com/duicym/glm-rush-plus
@@ -345,6 +345,13 @@
         if (obj.isSoldOut === true) obj.isSoldOut = false;
         if (obj.soldOut === true) obj.soldOut = false;
         if (obj.isServerBusy === true) obj.isServerBusy = false;
+        if (obj.isBusy === true) obj.isBusy = false;
+        if (obj.busy === true) obj.busy = false;
+        if (obj.overload === true) obj.overload = false;
+        if (obj.tooMany === true) obj.tooMany = false;
+        if (obj.isPeakTime === true) obj.isPeakTime = false;
+        if (obj.isLimit === true) obj.isLimit = false;
+        if (obj.limited === true) obj.limited = false;
         if (obj.disabled === true && (obj.price !== undefined || obj.productId || obj.title)) obj.disabled = false;
         if (obj.stock === 0) obj.stock = 999;
         for (const k of Object.keys(obj)) {
@@ -943,14 +950,31 @@
     //  主动抢购 & 定时
     // ═══════════════════════════════════════════
     function findBuyButton() {
-        for (const el of document.querySelectorAll('button.buy-btn')) {
+        // 第一优先：专属 class 的购买按钮
+        for (const el of document.querySelectorAll('button.buy-btn, button.purchase-btn, button.order-btn')) {
             if (el.offsetParent !== null) return el;
         }
+        // 第二优先：文字匹配（含"人数过多"按钮也找，因为我们会 forceClick 解除 disabled）
+        const buyTextReg = /购买|抢购|下单|特惠|订阅|立即购/;
+        const busyTextReg = /人数过多|繁忙|稍后|再试|排队/;
+        let busyBtn = null;
         for (const el of document.querySelectorAll('button, [role="button"]')) {
             const t = el.textContent.trim();
-            if (/购买|抢购|下单|特惠/.test(t) && t.length < 15 && el.offsetParent !== null) return el;
+            if (buyTextReg.test(t) && t.length < 20) {
+                if (el.offsetParent !== null) return el;  // 正常按钮优先
+            }
+            // 记录"人数过多"按钮作为备选
+            if (busyTextReg.test(t) && t.length < 20 && !busyBtn) busyBtn = el;
         }
-        return null;
+        // 第三优先：Max 卡片区域内的任意按钮
+        for (const card of document.querySelectorAll('[class*="card"],[class*="plan"],[class*="tier"],[class*="product"]')) {
+            const ct = card.textContent.toLowerCase();
+            if (!ct.includes('max') && !ct.includes('469')) continue;
+            for (const btn of card.querySelectorAll('button,[role="button"]')) {
+                if (btn.offsetParent !== null || window.getComputedStyle(btn).position === 'fixed') return btn;
+            }
+        }
+        return busyBtn; // 最后返回"人数过多"按钮（会被 forceClickButton 解除 disabled）
     }
 
     // 检测腾讯云验证码弹窗
@@ -995,9 +1019,9 @@
         // 第一阶段：点击购买按钮，处理验证码
         log('第1步: 点击购买按钮 (可能触发验证码)...');
         let buyBtn = findBuyButton();
-        if (buyBtn && buyBtn.offsetParent !== null) {
-            log('找到购买按钮，点击中...');
-            buyBtn.click();
+        if (buyBtn) {
+            log('找到购买按钮: "' + buyBtn.textContent.trim() + '"，强制点击中...');
+            forceClickButton(buyBtn);  // 用 forceClick 解除 disabled，绕过"人数过多"锁定
             // 等待验证码弹窗
             await sleep(2000);
 
@@ -1179,29 +1203,49 @@
     // ═══════════════════════════════════════════
     //  Vue isServerBusy 兜底 patch
     // ═══════════════════════════════════════════
+    const BUSY_KEYS = [
+        'isServerBusy', 'isBusy', 'busy', 'overload', 'tooMany',
+        'isPeakTime', 'isLimit', 'limited', 'isSoldOut', 'soldOut',
+        'serverBusy', 'buyDisabled', 'btnDisabled', 'purchaseDisabled',
+    ];
+
     function patchVueServerBusy() {
-        let attempts = 0;
+        // 持续 patch，每200ms检查一次，不停止（直到页面关闭）
         const tid = setInterval(() => {
-            attempts++;
-            if (attempts > 30) { clearInterval(tid); return; }
             const app = document.querySelector('#app');
-            const vue = app && app.__vue__;
+            const vue = app && (app.__vue__ || app.__vue_app__);
             if (!vue) return;
             let patched = 0;
             const walk = (vm, depth) => {
-                if (depth > 8) return;
-                if (vm.$data && vm.$data.isServerBusy === true) {
-                    vm.isServerBusy = false;
-                    patched++;
+                if (depth > 12) return;
+                const data = vm.$data || (vm._ && vm._.data) || {};
+                for (const key of BUSY_KEYS) {
+                    if (data[key] === true) {
+                        try { vm[key] = false; data[key] = false; patched++; } catch {}
+                    }
+                }
+                // Vue 3: setupState
+                if (vm.setupState) {
+                    for (const key of BUSY_KEYS) {
+                        try {
+                            if (vm.setupState[key] === true) { vm.setupState[key] = false; patched++; }
+                        } catch {}
+                    }
                 }
                 for (const child of (vm.$children || [])) walk(child, depth + 1);
+                // Vue 3 子组件
+                if (vm._ && vm._.subTree) {
+                    const walkVNode = (vnode, d) => {
+                        if (!vnode || d > 10) return;
+                        if (vnode.component) walk(vnode.component.proxy || vnode.component, d + 1);
+                        if (vnode.children && Array.isArray(vnode.children)) vnode.children.forEach(c => walkVNode(c, d + 1));
+                    };
+                    walkVNode(vm._.subTree, 0);
+                }
             };
             walk(vue, 0);
-            if (patched > 0) {
-                log('已解除 isServerBusy (' + patched + '个组件)');
-                clearInterval(tid);
-            }
-        }, 500);
+            if (patched > 0) log('已解除 busy 状态 (' + patched + '个字段)', 'info');
+        }, 200);
     }
 
     function forcePayDialog(responseData) {
