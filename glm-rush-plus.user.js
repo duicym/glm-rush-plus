@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 Plus
 // @namespace    https://github.com/duicym/glm-rush-plus
-// @version      1.0.7
+// @version      1.1.0
 // @description  自动捕获真实API参数 + 补全智谱自定义Headers (bigmodel-org/project) + WAF检测 + 极速并发
 // @author       duicym
 // @homepage     https://github.com/duicym/glm-rush-plus
@@ -67,6 +67,7 @@
         logs: [],
         stats: { total: 0, success: 0, errors: 0, avgMs: 0, startTime: 0 },
         captchaNeeded: false,   // 是否需要人工完成验证码
+        _proactiveSequence: 0,  // 防重入序列号，每次 startProactive 自增
     };
 
     function setState(patch) {
@@ -114,6 +115,18 @@
         else if (Array.isArray(h)) h.forEach(([k, v]) => (o[k] = v));
         else Object.entries(h).forEach(([k, v]) => (o[k] = v));
         return o;
+    }
+
+    // 给请求 body 加随机噪声，降低 WAF 重放检测
+    function addBodyNoise(bodyStr) {
+        if (!bodyStr) return bodyStr;
+        try {
+            const obj = JSON.parse(typeof bodyStr === 'string' ? bodyStr : String(bodyStr));
+            obj._t = Date.now() + Math.floor(Math.random() * 1000);
+            return JSON.stringify(obj);
+        } catch {
+            return bodyStr; // 无法解析则原样返回
+        }
     }
 
     // ═══════════════════════════════════════════
@@ -225,8 +238,15 @@
         log('点击按钮: ' + (btn.textContent || '').trim());
         btn.click();
 
+        // 记录此时 startProactive 的序列号（如果 forceClickButton 被 startProactive 调用）
+        const parentSeq = state._proactiveSequence;
+
         // 点击后检查是否捕获到了
         setTimeout(() => {
+            // 序列号检查：如果 startProactive 已经启动了新一轮，跳过本次回调
+            if (parentSeq > 0 && state._proactiveSequence !== parentSeq) {
+                return; // 这个 forceClickButton 的回调来自旧一轮 startProactive，忽略
+            }
             if (state.captured) {
                 log('✅ 成功通过按钮触发捕获到真实请求!');
                 // 只在没有主动抢购流程运行时才调度
@@ -356,7 +376,7 @@
         if (obj.isLimit === true) obj.isLimit = false;
         if (obj.limited === true) obj.limited = false;
         if (obj.disabled === true && (obj.price !== undefined || obj.productId || obj.title)) obj.disabled = false;
-        if (obj.stock === 0) obj.stock = 999;
+        if (obj.stock === 0 && (obj.productId || obj.productName || obj.salePrice !== undefined)) obj.stock = 999;
         for (const k of Object.keys(obj)) {
             if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
             if (obj[k] && typeof obj[k] === 'object') patchSoldOut(obj[k], visited);
@@ -532,23 +552,49 @@
                 }
             }
 
+            // 基于页面真实代码的完整响应码处理
             const reason = !data ? '非JSON'
                 : data.code === 1001 ? '缺少Auth(1001)'
-                : data.code === 555 ? '系统繁忙'
-                : (data.data && data.data.bizId === null) ? '售罄'
+                // 555: 服务器繁忙（人数过多）→ 短暂等待后自动重试
+                : data.code === 555 ? (() => {
+                    if (!state.captchaNeeded) {
+                        log('人数过多(555)，短暂等待后重试...', 'warn');
+                    }
+                    return '人数过多(555)';
+                })()
+                // 510000/510001: 风控拦截
+                : data.code === 510000 || data.code === 510001 ? (() => {
+                    const riskMsg = data.msg || data.message || '风控拦截';
+                    log('风控拦截: ' + riskMsg, 'error');
+                    if (!state.captchaNeeded) {
+                        setState({ captchaNeeded: true });
+                        log('⚠️ 风控拦截：' + riskMsg + '，可能需要重新验证', 'error');
+                        try { new Notification('GLM抢购助手', { body: '风控拦截: ' + riskMsg }); } catch {}
+                    }
+                    return '风控拦截(code=' + data.code + ')';
+                })()
+                // 560: 需要实名认证
+                : data.code === 560 ? (() => {
+                    log('需要实名认证，请前往 usercenter/settings/auth', 'error');
+                    try { new Notification('GLM抢购助手', { body: '需要实名认证！' }); } catch {}
+                    return '需要实名认证(560)';
+                })()
+                // 200 + soldOut=true: 售罄
+                : data.code === 200 && data.data && data.data.soldOut === true ? '售罄'
+                // 200 + bizId=null: 也是售罄
+                : data.code === 200 && data.data && data.data.bizId === null ? '售罄'
+                // 500: 检查是否验证码相关
                 : data.code === 500 ? (() => {
-                    // 检测验证码相关 500 错误
                     const msg = (data.msg || data.message || '').toLowerCase();
-                    if (msg.includes('验证码') || msg.includes('ticket') || msg.includes('验证')) {
-                        // 设置需要验证码标志，通知用户
+                    if (msg.includes('验证码') || msg.includes('ticket') || msg.includes('验证') || msg.includes('captcha')) {
                         if (!state.captchaNeeded) {
                             setState({ captchaNeeded: true });
-                            log('⚠️ 需要完成验证码! 请手动完成页面上的验证，然后点击「我已通过验证码，继续」', 'error');
+                            log('⚠️ 需要完成验证码! 验证码ticket无效或已过期，请手动完成验证', 'error');
                             try { new Notification('GLM抢购助手', { body: '需要完成验证码，请手动处理！' }); } catch {}
                         }
                         return '验证码 required';
                     }
-                    return 'code=500';
+                    return 'server error(500): ' + (data.msg || '');
                 })()
                 : 'code=' + data.code;
             return { ok: false, reason, attempt: attemptNum };
@@ -602,7 +648,9 @@
                     totalAttempt++;
                     const ac = new AbortController();
                     controllers.push(ac);
-                    promises.push(singleAttempt(url, { ...opts, headers: state.captured?.headers || opts.headers, signal: ac.signal }, totalAttempt));
+                    // body 随机噪声：每次请求加不同的 _t 参数，降低 WAF 重放检测
+                    const noisyBody = addBodyNoise(opts.body);
+                    promises.push(singleAttempt(url, { ...opts, body: noisyBody, headers: state.captured?.headers || opts.headers, signal: ac.signal }, totalAttempt));
                 }
 
                 setState({ count: totalAttempt });
@@ -632,6 +680,7 @@
                         stats: { ...state.stats, total: totalAttempt, success: state.stats.success + 1 },
                     });
                     log('成功! bizId=' + winner.bizId + ' (第' + winner.attempt + '次)');
+                    stopRequested = false; // 成功后重置停止标志，允许后续再次抢购
                     recoveryAttempts = 0;
                     setTimeout(autoRecover, 500);
                     return { ok: true, text: winner.text, data: winner.data, status: winner.status };
@@ -818,7 +867,10 @@
             }
 
             log('已捕获请求参数, 设定定时...');
-            autoScheduleIfNeeded();
+            // 只在没有主动抢购流程运行时才调度
+            if (!state.proactive && !state.captchaNeeded) {
+                autoScheduleIfNeeded();
+            }
             return _xhrSend.call(this, body);
         }
 
@@ -983,39 +1035,97 @@
         return busyBtn; // 最后返回"人数过多"按钮（会被 forceClickButton 解除 disabled）
     }
 
-    // 检测腾讯云验证码弹窗
+    // 直接调用页面 TencentCaptcha 进行验证
+    // 基于 open.bigmodel.cn 页面真实代码: appId=196026326, mode=bind
+    function triggerCaptchaDirectly() {
+        return new Promise((resolve, reject) => {
+            if (!window.TencentCaptcha) {
+                log('TencentCaptcha 未加载，等待页面加载验证码脚本...', 'warn');
+                // 尝试等待脚本加载
+                let attempts = 0;
+                const checkInterval = setInterval(() => {
+                    attempts++;
+                    if (window.TencentCaptcha) {
+                        clearInterval(checkInterval);
+                        log('TencentCaptcha 已就绪');
+                        _showCaptcha();
+                    } else if (attempts > 30) {
+                        clearInterval(checkInterval);
+                        reject(new Error('TencentCaptcha 加载超时'));
+                    }
+                }, 1000);
+                return;
+            }
+            _showCaptcha();
+
+            function _showCaptcha() {
+                try {
+                    const captcha = new window.TencentCaptcha('196026326', function(e) {
+                        if (e.ret === 0) {
+                            // 验证成功
+                            log('验证码通过！ticket:' + (e.ticket || '').slice(0, 16) + '...');
+                            resolve({ ticket: e.ticket, randstr: e.randstr });
+                        } else if (e.ret === 2) {
+                            // 用户取消
+                            log('用户取消了验证码');
+                            reject(new Error('用户取消验证'));
+                        } else {
+                            // 验证失败
+                            log('验证码验证失败(ret=' + e.ret + ')', 'error');
+                            reject(new Error('验证失败(ret=' + e.ret + ')'));
+                        }
+                    }, {
+                        mode: 'bind',
+                        type: 'popup',
+                        enableDarkMode: false,
+                        timeout: 60000,
+                    });
+                    captcha.show();
+                } catch (err) {
+                    log('验证码实例化失败: ' + err.message, 'error');
+                    reject(err);
+                }
+            }
+        });
+    }
+
+    // 检测腾讯云 TencentCaptcha 验证码弹窗
+    // 基于 open.bigmodel.cn 页面真实代码: appId=196026326, mode=bind, type=popup
+    // JS来源: turing.captcha.qcloud.com/TJCaptcha.js + turing.captcha.gtimg.com/1/dy-jy3.js
     function isCaptchaVisible() {
-        // 腾讯云 TCaptcha 的特征 DOM（精准匹配，避免误报）
-        const selectors = [
-            '#TCaptcha',                          // 腾讯云验证码主容器
-            '.tcaptcha',                         // class 形式
-            'iframe[src*="turing.captcha"]',    // 腾讯云验证码 iframe
-            'iframe[src*="captcha.qq.com"]',    // 腾讯 captcha 域名
-            'iframe[src*="verify.qq.com"]',     // 腾讯验证域名
-            '[class*="tcaptcha"]',              // tcaptcha 前缀 class
-            '[id*="tCaptcha"]',                 // tCaptcha 前缀 id
+        // TCaptcha 的精确 DOM 特征
+        const preciseSelectors = [
+            '#tcaptcha_iframe',                    // TCaptcha 的 iframe ID (最常见)
+            '#TencentCaptcha',                     // TencentCaptcha 容器
+            '.tcaptcha-transform',                 // TCaptcha transform 层
+            'iframe[src*="turing.captcha.qcloud.com"]', // 腾讯云验证码服务
+            'iframe[src*="turing.captcha.gtimg.com"]',  // 腾讯CDN验证码
         ];
-        for (const sel of selectors) {
+        for (const sel of preciseSelectors) {
             const el = document.querySelector(sel);
             if (!el) continue;
-            // 元素必须可见且有足够尺寸（验证码弹窗通常 >100x100）
             const rect = el.getBoundingClientRect();
             const s = window.getComputedStyle(el);
-            if (rect.width > 100 && rect.height > 100 &&
-                s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' &&
-                el.offsetParent !== null) {
+            // 验证码弹窗至少 200x200，且在页面可见区域
+            if (rect.width >= 200 && rect.height >= 200 &&
+                s.display !== 'none' && s.visibility !== 'hidden' &&
+                parseFloat(s.opacity) > 0.1) {
                 return true;
             }
         }
-        // 文字检测：只在固定弹窗/遮罩层内检查（避免全页面误报）
-        const dialogSelectors = ['.el-dialog', '.ant-modal', '.dialog', '.modal', '[class*="overlay"]', '[class*="mask"]', '[class*="popup"]'];
-        for (const sel of dialogSelectors) {
-            const el = document.querySelector(sel);
-            if (!el) continue;
-            const s = window.getComputedStyle(el);
-            if (s.display === 'none' || s.visibility === 'hidden') continue;
+        // 文字检测：只在 TCaptcha 相关容器内检查，避免全页面误报
+        const captchaContainers = document.querySelectorAll('#tcaptcha_iframe, #TencentCaptcha, .tcaptcha-transform');
+        for (const container of captchaContainers) {
+            const text = (container.textContent || '');
+            if (/拖动下方拼图完成验证|安全验证|请完成验证码/i.test(text)) {
+                return true;
+            }
+        }
+        // 备选：检测页面底部固定定位的验证码浮层（页面截图确认存在）
+        const fixedEls = document.querySelectorAll('[style*="position: fixed"], [style*="position:fixed"]');
+        for (const el of fixedEls) {
             const text = el.textContent || '';
-            if (/请完成安全验证|请完成人机验证|请完成验证码|滑块验证|点选验证|验证失败|安全校验/i.test(text)) {
+            if (text.length < 100 && /拖动.*拼图.*验证|安全验证.*拖动/i.test(text)) {
                 return true;
             }
         }
@@ -1038,8 +1148,9 @@
             return;
         }
 
-        // 标记进入主动抢购流程（防止 autoScheduleIfNeeded 打断）
-        setState({ proactive: true });
+        // 标记进入主动抢购流程（防止 autoScheduleIfNeeded 打断 + 防重入序列号）
+        const seq = ++state._proactiveSequence;
+        setState({ proactive: true, _proactiveSequence: seq });
 
         // 第一阶段：点击购买按钮，处理验证码
         log('第1步: 点击购买按钮 (可能触发验证码)...');
@@ -1204,7 +1315,7 @@
             const remaining = target.getTime() - getServerNow();
             if (remaining > 0 && remaining < 60000) {
                 const timerEl = _shadowRef?.getElementById('timer-info');
-                if (timerEl) timerEl.textContent = '-' + (remaining / 1000).toFixed(1) + 's';
+                if (timerEl) timerEl.textContent = '-' + Math.ceil(remaining / 1000) + 's';
             }
             if (remaining <= 0) {
                 clearInterval(tid);
@@ -1214,7 +1325,7 @@
                 log('时间到! 自动启动抢购!');
                 startProactive();
             }
-        }, 10);
+        }, 100);
 
         setState({ timerId: tid });
     }
@@ -1257,8 +1368,10 @@
     ];
 
     function patchVueServerBusy() {
-        // 持续 patch，每200ms检查一次，不停止（直到页面关闭）
+        // 持续 patch，每200ms检查一次
+        let stopped = false;
         const tid = setInterval(() => {
+            if (stopped) return;
             const app = document.querySelector('#app');
             const vue = app && (app.__vue__ || app.__vue_app__);
             if (!vue) return;
@@ -1293,6 +1406,24 @@
             walk(vue, 0);
             if (patched > 0) log('已解除 busy 状态 (' + patched + '个字段)', 'info');
         }, 200);
+
+        // MutationObserver: 监听 #app 是否被替换 (SPA 导航)
+        const appEl = document.querySelector('#app');
+        if (appEl && appEl.parentNode) {
+            const mo = new MutationObserver((mutations) => {
+                for (const m of mutations) {
+                    for (const node of (m.removedNodes || [])) {
+                        if (node === appEl || (node.contains && node.contains(appEl))) {
+                            stopped = true;
+                            clearInterval(tid);
+                            mo.disconnect();
+                            return;
+                        }
+                    }
+                }
+            });
+            mo.observe(appEl.parentNode, { childList: true });
+        }
     }
 
     function forcePayDialog(responseData) {
