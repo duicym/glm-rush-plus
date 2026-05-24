@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 Plus
 // @namespace    https://github.com/duicym/glm-rush-plus
-// @version      1.1.0
+// @version      1.1.1
 // @description  自动捕获真实API参数 + 补全智谱自定义Headers (bigmodel-org/project) + WAF检测 + 极速并发
 // @author       duicym
 // @homepage     https://github.com/duicym/glm-rush-plus
@@ -22,14 +22,18 @@
     const DEFAULT_CFG = {
         targetPlan: 'max',     // 目标套餐: lite / pro / max
         productIdOverride: null, // 如果指定了 productId，直接用它，否则自动从页面提取
-        concurrency: 3,         // 常规并发数（降低避免WAF封禁）
-        turboConcurrency: 4,    // 抢购前N秒的并发数（降低避免WAF封禁）
-        turboSec: 5,
-        maxRetry: 2000,
-        burstCount: 10,          // 前N次请求无延迟（降低）
-        fastDelay: 80,           // 快速阶段延迟 ms（增加）
-        slowDelay: 200,           // 慢速阶段延迟 ms（增加）
-        jitter: 0.5,             // 随机抖动系数（提高随机性）
+        concurrency: 1,         // 常规并发数（极限防WAF：单路）
+        turboConcurrency: 2,    // 抢购前N秒的并发数（极限防WAF：2路）
+        turboSec: 3,            // turbo窗口缩短
+        maxRetry: 500,           // 总次数降低，避免长时间被检测
+        burstCount: 0,           // 无burst，所有请求都有延迟
+        fastDelay: 400,          // 快速阶段延迟 ms（大幅增加）
+        slowDelay: 800,          // 慢速阶段延迟 ms（大幅增加）
+        jitter: 1.0,             // 100%随机抖动（delay范围: 0 ~ 2x base）
+        staggerMs: 150,          // 同批次请求错开发送（ms）
+        preDelayMin: 1000,       // 首轮请求前随机延迟最小值
+        preDelayMax: 4000,       // 首轮请求前随机延迟最大值
+        mouseSimulation: true,   // 是否模拟鼠标移动
         recoveryMax: 3,
         logMax: 100,
         rushTime: '10:00:00',
@@ -68,6 +72,7 @@
         stats: { total: 0, success: 0, errors: 0, avgMs: 0, startTime: 0 },
         captchaNeeded: false,   // 是否需要人工完成验证码
         _proactiveSequence: 0,  // 防重入序列号，每次 startProactive 自增
+        wafCooldownUntil: 0,    // WAF 封禁后的冷却时间戳，此时间之前拒绝新请求
     };
 
     function setState(patch) {
@@ -127,6 +132,23 @@
         } catch {
             return bodyStr; // 无法解析则原样返回
         }
+    }
+
+    // 模拟真实用户鼠标移动（降低WAF bot检测）
+    function simulateMouseMovement() {
+        try {
+            const evt = new MouseEvent('mousemove', {
+                bubbles: true, cancelable: true,
+                clientX: Math.random() * window.innerWidth,
+                clientY: Math.random() * window.innerHeight,
+                movementX: (Math.random() - 0.5) * 50,
+                movementY: (Math.random() - 0.5) * 50,
+            });
+            document.dispatchEvent(evt);
+            // 再模拟一次点击附近的元素
+            const planCard = document.querySelector('[class*="plan"], [class*="card"], [class*="tier"]');
+            if (planCard) planCard.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+        } catch {}
     }
 
     // ═══════════════════════════════════════════
@@ -499,14 +521,21 @@
             }
 
             // 补全更真实的浏览器 headers（降低WAF识别风险）
+            // 每次请求随机微调 Accept-Language 权重，让请求更不像机器人
+            const zhQ = (0.7 + Math.random() * 0.25).toFixed(2);
+            const enQ = (0.5 + Math.random() * 0.3).toFixed(2);
+            randHeaders['Accept-Language'] = 'zh-CN,zh;q=' + zhQ + ',en;q=' + enQ;
             randHeaders['Accept'] = 'application/json, text/plain, */*';
-            randHeaders['Accept-Language'] = 'zh-CN,zh;q=0.9,en;q=0.8';  // 修正拼写
             randHeaders['Accept-Encoding'] = 'gzip, deflate, br';
             randHeaders['Cache-Control'] = 'no-cache';
             randHeaders['Pragma'] = 'no-cache';
             randHeaders['Sec-Fetch-Dest'] = 'empty';
             randHeaders['Sec-Fetch-Mode'] = 'cors';
             randHeaders['Sec-Fetch-Site'] = 'same-origin';
+            // 偶尔添加一个无关 header 模拟不同浏览器版本
+            if (Math.random() < 0.4) randHeaders['DNT'] = '1';
+            if (Math.random() < 0.3) randHeaders['Upgrade-Insecure-Requests'] = '1';
+            else delete randHeaders['Upgrade-Insecure-Requests'];
 
             // 随机去掉一些 headers 让请求更自然
             if (Math.random() < 0.3) delete randHeaders['X-Request-Id'];
@@ -518,9 +547,11 @@
                 return { ok: false, reason: 'HTTP ' + resp.status + ' 会话过期', attempt: attemptNum };
             }
             if (resp.status === 405) {
-                // WAF 封禁 — 立即停止全部重试
-                log('WAF 封禁! (405), 立即停止避免 IP 被封', 'error');
+                // WAF 封禁 — 立即停止全部重试 + 设置5分钟冷却
+                log('WAF 封禁! (405), 立即停止并冷却5分钟', 'error');
                 stopRequested = true;
+                setState({ wafCooldownUntil: Date.now() + 300000 });
+                try { new Notification('GLM抢购助手', { body: 'WAF封禁(405)! 5分钟内不会重试，建议换网络' }); } catch {}
                 return { ok: false, reason: 'WAF封禁(405)', attempt: attemptNum };
             }
             if (resp.status === 429) {
@@ -610,11 +641,24 @@
             return _retryLock;
         }
 
+        // WAF 冷却检查
+        if (state.wafCooldownUntil > Date.now()) {
+            const remainSec = Math.ceil((state.wafCooldownUntil - Date.now()) / 1000);
+            log('WAF冷却中, 还需 ' + remainSec + ' 秒...', 'warn');
+            return { ok: false, reason: 'WAF冷却中' };
+        }
+
         stopRequested = false;
         const { signal, ...opts } = rawOpts || {};
 
         _retryLock = (async () => {
             setState({ status: 'retrying', count: 0, stats: { ...state.stats, startTime: performance.now() } });
+
+            // 🔑 首轮延迟 + 模拟人类行为（降低 WAF 检测率）
+            if (CFG.mouseSimulation) simulateMouseMovement();
+            const preDelay = CFG.preDelayMin + Math.random() * (CFG.preDelayMax - CFG.preDelayMin);
+            await sleep(Math.round(preDelay));
+            if (CFG.mouseSimulation) simulateMouseMovement();
 
             let totalAttempt = 0;
             let consecutiveErrors = 0;
@@ -648,7 +692,11 @@
                     totalAttempt++;
                     const ac = new AbortController();
                     controllers.push(ac);
-                    // body 随机噪声：每次请求加不同的 _t 参数，降低 WAF 重放检测
+                    // 错开发送：同批次请求间隔随机 50~staggerMs ms（避免同时发出被WAF识别）
+                    if (j > 0) await sleep(50 + Math.random() * (CFG.staggerMs - 50));
+                    // 期间偶尔模拟鼠标
+                    if (CFG.mouseSimulation && j % 2 === 0) simulateMouseMovement();
+                    // body 随机噪声：每次请求加不同的 _t 参数
                     const noisyBody = addBodyNoise(opts.body);
                     promises.push(singleAttempt(url, { ...opts, body: noisyBody, headers: state.captured?.headers || opts.headers, signal: ac.signal }, totalAttempt));
                 }
@@ -1133,6 +1181,12 @@
     }
 
     async function startProactive() {
+        // WAF 冷却检查
+        if (state.wafCooldownUntil > Date.now()) {
+            const remainSec = Math.ceil((state.wafCooldownUntil - Date.now()) / 1000);
+            log('WAF冷却中, 还需 ' + remainSec + ' 秒，建议换网络后清除冷却再试', 'error');
+            return;
+        }
         if (!state.captured) {
             log('无捕获参数, 尝试自动捕获...');
             autoCaptureParams();
@@ -1220,9 +1274,9 @@
 
     function stopAll() {
         stopRequested = true;
-        setState({ proactive: false, status: 'idle', count: 0 });
+        setState({ proactive: false, status: 'idle', count: 0, wafCooldownUntil: 0 });
         if (state.timerId) { clearInterval(state.timerId); setState({ timerId: null }); }
-        log('已停止');
+        log('已停止 (WAF冷却已清除)');
     }
 
     // ═══════════════════════════════════════════
