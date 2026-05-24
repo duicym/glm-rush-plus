@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 Plus
 // @namespace    https://github.com/duicym/glm-rush-plus
-// @version      1.0.5
+// @version      1.0.6
 // @description  自动捕获真实API参数 + 补全智谱自定义Headers (bigmodel-org/project) + WAF检测 + 极速并发
 // @author       duicym
 // @homepage     https://github.com/duicym/glm-rush-plus
@@ -229,7 +229,10 @@
         setTimeout(() => {
             if (state.captured) {
                 log('✅ 成功通过按钮触发捕获到真实请求!');
-                autoScheduleIfNeeded();
+                // 只在没有主动抢购流程运行时才调度
+                if (!state.proactive && !state.captchaNeeded) {
+                    autoScheduleIfNeeded();
+                }
             } else {
                 log('⚠️ 按钮点击后未捕获到请求, 可能是按钮仍被禁用或拦截器未触发');
                 log('提示: 如果所有套餐均售罄，按钮可能跳转到其他页面而非发 API 请求');
@@ -750,7 +753,10 @@
             }
 
             log('已捕获请求参数, 设定定时...');
-            autoScheduleIfNeeded();
+            // 只在没有主动抢购流程运行时才调度（避免打断 startProactive 的验证码等待流程）
+            if (!state.proactive && !state.captchaNeeded) {
+                autoScheduleIfNeeded();
+            }
             return _fetch.apply(this, [input, init]);
         }
 
@@ -1016,6 +1022,9 @@
             return;
         }
 
+        // 标记进入主动抢购流程（防止 autoScheduleIfNeeded 打断）
+        setState({ proactive: true });
+
         // 第一阶段：点击购买按钮，处理验证码
         log('第1步: 点击购买按钮 (可能触发验证码)...');
         let buyBtn = findBuyButton();
@@ -1048,7 +1057,7 @@
         }
 
         // 第二阶段：正式抢购
-        setState({ proactive: true });
+        // state.proactive 已在第1阶段开始时设为 true
         log('第2步: 极速抢购启动! 前' + CFG.turboSec + '秒' + CFG.turboConcurrency + '路并发, 之后' + CFG.concurrency + '路');
 
         const { url, method, body } = state.captured;
@@ -1113,7 +1122,8 @@
     }
 
     function autoScheduleIfNeeded() {
-        if (state.timerId || state.status === 'retrying' || state.status === 'success') return;
+        // 如果正在抢购或等待验证码，不要打断
+        if (state.timerId || state.status === 'retrying' || state.status === 'success' || state.proactive || state.captchaNeeded) return;
 
         const parts = CFG.rushTime.split(':').map(Number);
         const now = new Date(getServerNow());
@@ -1121,11 +1131,12 @@
 
         if (target.getTime() <= getServerNow()) {
             const passedSec = (getServerNow() - target.getTime()) / 1000;
-            if (passedSec < 30) {
+            if (passedSec < 600) {
+                // 10分钟内都算"当天开抢窗口"，立即启动
                 log('已过' + CFG.rushTime + ' ' + passedSec.toFixed(0) + '秒, 立即开抢!');
                 startProactive();
             } else {
-                log('今天' + CFG.rushTime + '已过, 明天自动抢购');
+                log('今天' + CFG.rushTime + '已过(超10分钟), 明天自动抢购');
             }
             return;
         }
@@ -1141,7 +1152,16 @@
 
         const now = new Date(getServerNow());
         const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), parts[0], parts[1], parts[2] || 0);
-        if (target.getTime() <= getServerNow()) { log('目标时间已过'); return; }
+        if (target.getTime() <= getServerNow()) {
+            const passedSec = (getServerNow() - target.getTime()) / 1000;
+            if (passedSec < 600) {
+                log('目标时间刚过 ' + passedSec.toFixed(0) + '秒，立即开抢！');
+                startProactive();
+            } else {
+                log('目标时间已过（超10分钟），跳过');
+            }
+            return;
+        }
 
         const ms = target.getTime() - getServerNow();
         log('定时: ' + timeStr + ' (' + Math.ceil(ms / 1000) + '秒后)');
