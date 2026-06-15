@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         智谱 GLM Coding 抢购助手 Plus
 // @namespace    https://github.com/duicym/glm-rush-plus
-// @version      1.1.1
-// @description  自动捕获真实API参数 + 补全智谱自定义Headers (bigmodel-org/project) + WAF检测 + 极速并发
+// @version      1.2.0
+// @description  自动捕获真实API参数 + 补全智谱自定义Headers (bigmodel-org/project) + WAF检测 + 极速并发 + 性能优化
 // @author       duicym
 // @homepage     https://github.com/duicym/glm-rush-plus
 // @supportURL   https://github.com/duicym/glm-rush-plus/issues
@@ -20,24 +20,35 @@
     //  配置
     // ═══════════════════════════════════════════
     const DEFAULT_CFG = {
-        targetPlan: 'max',     // 目标套餐: lite / pro / max
-        productIdOverride: null, // 如果指定了 productId，直接用它，否则自动从页面提取
-        concurrency: 1,         // 常规并发数（极限防WAF：单路）
-        turboConcurrency: 2,    // 抢购前N秒的并发数（极限防WAF：2路）
-        turboSec: 3,            // turbo窗口缩短
-        maxRetry: 500,           // 总次数降低，避免长时间被检测
-        burstCount: 0,           // 无burst，所有请求都有延迟
-        fastDelay: 400,          // 快速阶段延迟 ms（大幅增加）
-        slowDelay: 800,          // 慢速阶段延迟 ms（大幅增加）
-        jitter: 1.0,             // 100%随机抖动（delay范围: 0 ~ 2x base）
-        staggerMs: 150,          // 同批次请求错开发送（ms）
-        preDelayMin: 1000,       // 首轮请求前随机延迟最小值
-        preDelayMax: 4000,       // 首轮请求前随机延迟最大值
-        mouseSimulation: true,   // 是否模拟鼠标移动
-        recoveryMax: 3,
-        logMax: 100,
-        rushTime: '10:00:00',
-        autoCapture: true,
+        // 目标套餐配置
+        targetPlan: 'max',           // 目标套餐: lite / pro / max
+        productIdOverride: null,     // 如果指定了 productId，直接用它，否则自动从页面提取
+        
+        // 并发控制配置（防 WAF 检测）
+        concurrency: 1,              // 常规并发数（极限防WAF：单路）
+        turboConcurrency: 2,         // 抢购前N秒的并发数（极限防WAF：2路）
+        turboSec: 3,                 // turbo 窗口时长（秒）
+        
+        // 重试策略配置
+        maxRetry: 500,               // 总重试次数（降低避免长时间被检测）
+        burstCount: 0,               // 无 burst，所有请求都有延迟
+        fastDelay: 400,              // 快速阶段延迟 ms（大幅增加）
+        slowDelay: 800,              // 慢速阶段延迟 ms（大幅增加）
+        jitter: 1.0,                 // 100%随机抖动（delay范围: 0 ~ 2x base）
+        staggerMs: 150,              // 同批次请求错开发送（ms）
+        preDelayMin: 1000,           // 首轮请求前随机延迟最小值
+        preDelayMax: 4000,           // 首轮请求前随机延迟最大值
+        
+        // 功能开关
+        mouseSimulation: true,       // 是否模拟鼠标移动
+        autoCapture: true,           // 是否自动捕获参数
+        
+        // UI 和日志配置
+        recoveryMax: 3,              // 弹窗恢复最大次数
+        logMax: 100,                 // 最大日志条数
+        rushTime: '10:00:00',        // 定时抢购时间
+        
+        // 内部 API 路径（不持久化到 localStorage）
         PREVIEW: '/api/biz/pay/preview',
         CHECK: '/api/biz/pay/check',
     };
@@ -50,6 +61,7 @@
         return { ...DEFAULT_CFG };
     }
     function saveCfg(cfg) {
+        // 过滤内部 API 路径字段（PREVIEW/CHECK），这些不应该持久化到 localStorage
         const { PREVIEW, CHECK, ...save } = cfg;
         try { localStorage.setItem('glm_rush_plus_cfg', JSON.stringify(save)); } catch {}
     }
@@ -75,9 +87,16 @@
         wafCooldownUntil: 0,    // WAF 封禁后的冷却时间戳，此时间之前拒绝新请求
     };
 
+    // UI 刷新防抖，避免频繁重渲染
+    let uiRefreshTimer = null;
     function setState(patch) {
         state = { ...state, ...patch };
-        refreshUI();
+        // 防抖：16ms（约一帧）内多次调用只刷新一次
+        if (uiRefreshTimer) return;
+        uiRefreshTimer = setTimeout(() => {
+            uiRefreshTimer = null;
+            refreshUI();
+        }, 16);
     }
 
     // 恢复上次捕获的请求
@@ -95,7 +114,8 @@
     //  工具
     // ═══════════════════════════════════════════
     const sleep = ms => new Promise(r => setTimeout(r, ms));
-    const ts = () => new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    // 格式化当前时间为字符串，用于日志记录
+    const formatTime = () => new Date().toLocaleTimeString('zh-CN', { hour12: false });
     const jitteredDelay = base => Math.round(base * (1 + (Math.random() * 2 - 1) * CFG.jitter));
 
     function getDelay(attempt) {
@@ -105,7 +125,7 @@
     }
 
     function log(msg, level = 'info') {
-        const entry = { ts: ts(), msg, level };
+        const entry = { ts: formatTime(), msg, level };
         const logs = [...state.logs, entry];
         if (logs.length > CFG.logMax) logs.splice(0, logs.length - CFG.logMax);
         state = { ...state, logs };
@@ -113,6 +133,10 @@
         appendLogDOM(entry);
     }
 
+    /**
+     * 从请求 headers 中提取为普通对象
+     * 处理三种格式：Headers 实例、二维数组、普通对象
+     */
     function extractHeaders(h) {
         const o = {};
         if (!h) return o;
@@ -120,18 +144,6 @@
         else if (Array.isArray(h)) h.forEach(([k, v]) => (o[k] = v));
         else Object.entries(h).forEach(([k, v]) => (o[k] = v));
         return o;
-    }
-
-    // 给请求 body 加随机噪声，降低 WAF 重放检测
-    function addBodyNoise(bodyStr) {
-        if (!bodyStr) return bodyStr;
-        try {
-            const obj = JSON.parse(typeof bodyStr === 'string' ? bodyStr : String(bodyStr));
-            obj._t = Date.now() + Math.floor(Math.random() * 1000);
-            return JSON.stringify(obj);
-        } catch {
-            return bodyStr; // 无法解析则原样返回
-        }
     }
 
     // 模拟真实用户鼠标移动（降低WAF bot检测）
@@ -228,16 +240,28 @@
 
     // 强制点击：绕过 Vue disabled 状态
     function forceClickButton(btn) {
+        const btnText = (btn.textContent || '').trim();
+        log('准备强制点击按钮: "' + btnText + '"');
+        
         // 先解除 HTML disabled 属性
         btn.disabled = false;
         btn.classList.remove('disabled', 'is-disabled', 'el-button--disabled');
         btn.removeAttribute('disabled');
+        
+        // 如果按钮文字包含"人数过多"，尝试修改按钮文字为"立即订阅"
+        if (/人数过多|繁忙|稍后/.test(btnText)) {
+            log('检测到人数过多按钮，尝试恢复按钮文字');
+            // 尝试修改按钮文字
+            try {
+                btn.textContent = '立即订阅';
+            } catch {}
+        }
 
         // 通过 __vue__ 解除 Vue 组件级别的 disabled
         let vm = btn.__vue__;
         if (vm) {
             // 尝试各种可能的 disabled 字段名
-            for (const key of ['disabled', 'isDisabled', 'btnDisabled', '_disabled']) {
+            for (const key of ['disabled', 'isDisabled', 'btnDisabled', '_disabled', 'loading', 'isServerBusy', 'isBusy']) {
                 if (key in vm) {
                     try { vm[key] = false; } catch {}
                 }
@@ -251,6 +275,14 @@
                     if (key in vm.$props) {
                         try { vm.$props[key] = false; } catch {}
                     }
+                }
+            }
+            // Vue 3 setupState
+            if (vm.setupState) {
+                for (const key of ['disabled', 'isDisabled', 'isServerBusy', 'isBusy']) {
+                    try {
+                        if (vm.setupState[key] === true) vm.setupState[key] = false;
+                    } catch {}
                 }
             }
             log('已尝试解除 Vue 组件级别 disabled');
@@ -381,12 +413,21 @@
 
     // ═══════════════════════════════════════════
     //  JSON.parse 定向拦截
+    //  优化：添加开关控制，默认启用但允许通过配置关闭
     // ═══════════════════════════════════════════
     const _parse = JSON.parse;
+    
+    // 添加配置项：是否启用 JSON.parse 劫持（默认 true）
+    const ENABLE_JSON_PATCH = true;
 
     function patchSoldOut(obj, visited = new WeakSet()) {
         if (!obj || typeof obj !== 'object' || visited.has(obj)) return;
         visited.add(obj);
+        // 只在对象包含商品相关字段时才进行 patch，缩小影响范围
+        const isProductRelated = obj.productId || obj.productName || obj.price !== undefined || 
+                                obj.salePrice !== undefined || obj.stock !== undefined;
+        if (!isProductRelated) return;
+        
         if (obj.isSoldOut === true) obj.isSoldOut = false;
         if (obj.soldOut === true) obj.soldOut = false;
         if (obj.isServerBusy === true) obj.isServerBusy = false;
@@ -397,20 +438,22 @@
         if (obj.isPeakTime === true) obj.isPeakTime = false;
         if (obj.isLimit === true) obj.isLimit = false;
         if (obj.limited === true) obj.limited = false;
-        if (obj.disabled === true && (obj.price !== undefined || obj.productId || obj.title)) obj.disabled = false;
-        if (obj.stock === 0 && (obj.productId || obj.productName || obj.salePrice !== undefined)) obj.stock = 999;
+        if (obj.disabled === true) obj.disabled = false;
+        if (obj.stock === 0) obj.stock = 999;
         for (const k of Object.keys(obj)) {
             if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
             if (obj[k] && typeof obj[k] === 'object') patchSoldOut(obj[k], visited);
         }
     }
 
-    JSON.parse = function (text, reviver) {
-        const result = _parse(text, reviver);
-        try { patchSoldOut(result); } catch {}
-        return result;
-    };
-    Object.defineProperty(JSON.parse, 'toString', { value: () => 'function parse() { [native code] }' });
+    if (ENABLE_JSON_PATCH) {
+        JSON.parse = function (text, reviver) {
+            const result = _parse(text, reviver);
+            try { patchSoldOut(result); } catch {}
+            return result;
+        };
+        Object.defineProperty(JSON.parse, 'toString', { value: () => 'function parse() { [native code] }' });
+    }
 
     // ═══════════════════════════════════════════
     //  核心: 并发重试引擎
@@ -426,7 +469,16 @@
             if (h['Authorization']) return h['Authorization'].replace('Bearer ', '');
             if (h['authorization']) return h['authorization'].replace('Bearer ', '');
         }
-        // 2. 从 localStorage 提取 (Coding Plan 页面用户数据)
+        // 2. 从 cookie 提取（优先，因为 cookie 可能已更新）
+        try {
+            const cookies = document.cookie.split(';');
+            for (const c of cookies) {
+                const [k, v] = c.trim().split('=');
+                if (!k || !v) continue;
+                if (/token|auth|jwt|session|passport/i.test(k) && v.length > 20) return v;
+            }
+        } catch {}
+        // 3. 从 localStorage 提取 (Coding Plan 页面用户数据)
         try {
             const keys = ['user', 'currentUser', 'userInfo', 'token', 'accessToken', 'access_token', 'auth'];
             for (const k of keys) {
@@ -439,15 +491,6 @@
                 } catch {
                     if (raw.length > 30 && raw.length < 500) return raw.replace('Bearer ', '');
                 }
-            }
-        } catch {}
-        // 3. 从 cookie 提取
-        try {
-            const cookies = document.cookie.split(';');
-            for (const c of cookies) {
-                const [k, v] = c.trim().split('=');
-                if (!k || !v) continue;
-                if (/token|auth|jwt|session|passport/i.test(k) && v.length > 20) return v;
             }
         } catch {}
         // 4. 从 Vuex Store 提取
@@ -504,11 +547,16 @@
         try {
             // 用捕获的完整 headers 作为基础，再补随机头
             const baseHeaders = enrichHeaders(opts.headers || {});
+            // 每次请求都重新获取最新的 auth token，避免使用过期 token
             const authToken = getAuthToken();
             const randHeaders = { ...baseHeaders };
-            if (authToken && !randHeaders['Authorization'] && !randHeaders['authorization']) {
+            
+            // 强制使用最新的 token，覆盖可能过期的旧 token
+            if (authToken) {
                 randHeaders['Authorization'] = 'Bearer ' + authToken;
                 randHeaders['authorization'] = randHeaders['Authorization'];
+            } else if (!randHeaders['Authorization'] && !randHeaders['authorization']) {
+                log('⚠️ 警告: 无法获取 auth token', 'warn');
             }
             // 补智谱自定义 headers（如果捕获时没拿到，尝试从 cookie 解析）
             if (!randHeaders['bigmodel-organization']) {
@@ -561,6 +609,22 @@
             const text = await resp.text();
             let data;
             try { data = _parse(text); } catch { data = null; }
+
+            // 检查响应体中的业务错误码
+            if (data && data.code === 401) {
+                // 令牌过期 - 尝试刷新 token 后继续
+                log('令牌已过期(401), 尝试刷新认证信息...', 'warn');
+                
+                // 尝试从页面重新获取最新的 auth token
+                const freshToken = getAuthToken();
+                if (freshToken) {
+                    log('已获取新 token, 将在下次重试时使用');
+                    // 不立即停止，让重试机制继续使用新 token
+                } else {
+                    log('无法获取新 token, 会话确实已过期', 'error');
+                    return { ok: false, reason: '令牌过期且无法刷新', attempt: attemptNum };
+                }
+            }
 
             if (data && data.code === 200 && data.data && data.data.bizId) {
                 const bizId = data.data.bizId;
@@ -760,6 +824,19 @@
                     return { ok: false };
                 }
 
+                // 令牌过期处理
+                if (reasons.some(r => r.includes('令牌过期') || r.includes('令牌已过期'))) {
+                    log('⚠️ 令牌已过期, 停止重试', 'error');
+                    try {
+                        new Notification('GLM抢购助手', { 
+                            body: '令牌已过期！请刷新页面重新登录后再试',
+                            requireInteraction: true 
+                        });
+                    } catch {}
+                    setState({ status: 'failed' });
+                    return { ok: false };
+                }
+
                 if (reasons.some(r => r.includes('429') || r.includes('限流'))) {
                     throttleCount++;
                     const backoff = Math.min(2000 * (2 ** Math.min(throttleCount, 4)), 16000);
@@ -808,11 +885,16 @@
 
     // ═══════════════════════════════════════════
     //  Fetch 拦截
+    //  优化：使用路径前缀匹配，只拦截目标 API 请求
     // ═══════════════════════════════════════════
+    const PREVIEW_PATH = CFG.PREVIEW;
+    const CHECK_PATH = CFG.CHECK;
+    
     window.fetch = async function (input, init) {
         const url = typeof input === 'string' ? input : input?.url;
 
-        if (url && url.includes(CFG.PREVIEW)) {
+        // 拦截 preview 请求
+        if (url && url.includes(PREVIEW_PATH)) {
             // 捕获请求参数
             const captured = {
                 url,
@@ -857,7 +939,7 @@
             return _fetch.apply(this, [input, init]);
         }
 
-        if (url && url.includes(CFG.CHECK) && url.includes('bizId=null')) {
+        if (url && url.includes(CHECK_PATH) && url.includes('bizId=null')) {
             log('拦截 check(bizId=null)');
             return new Response('{"code":-1,"msg":"等待有效bizId"}', {
                 status: 200, headers: { 'Content-Type': 'application/json' },
@@ -886,7 +968,7 @@
     XMLHttpRequest.prototype.send = function (body) {
         const url = this._u;
 
-        if (typeof url === 'string' && url.includes(CFG.PREVIEW)) {
+        if (typeof url === 'string' && url.includes(PREVIEW_PATH)) {
             const self = this;
             const captured = { url, method: this._m, body, headers: this._h || {} };
             setState({ captured });
@@ -922,7 +1004,7 @@
             return _xhrSend.call(this, body);
         }
 
-        if (typeof url === 'string' && url.includes(CFG.CHECK) && url.includes('bizId=null')) {
+        if (typeof url === 'string' && url.includes(CHECK_PATH) && url.includes('bizId=null')) {
             fakeXHR(this, '{"code":-1,"msg":"等待有效bizId"}');
             return;
         }
@@ -1060,18 +1142,36 @@
         for (const el of document.querySelectorAll('button.buy-btn, button.purchase-btn, button.order-btn')) {
             if (el.offsetParent !== null) return el;
         }
-        // 第二优先：文字匹配（含"人数过多"按钮也找，因为我们会 forceClick 解除 disabled）
+        
+        // 第二优先：文字匹配
+        // 注意：人数过多时按钮文字可能是"抢购人数过多"或"立即订阅人数过多"
         const buyTextReg = /购买|抢购|下单|特惠|订阅|立即购/;
         const busyTextReg = /人数过多|繁忙|稍后|再试|排队/;
         let busyBtn = null;
+        let normalBtn = null;
+        
         for (const el of document.querySelectorAll('button, [role="button"]')) {
             const t = el.textContent.trim();
-            if (buyTextReg.test(t) && t.length < 20) {
-                if (el.offsetParent !== null) return el;  // 正常按钮优先
+            if (t.length >= 20) continue;
+            
+            // 如果是"人数过多"按钮，记录为备选
+            if (busyTextReg.test(t)) {
+                if (!busyBtn) busyBtn = el;
+                continue; // 继续查找是否有正常按钮
             }
-            // 记录"人数过多"按钮作为备选
-            if (busyTextReg.test(t) && t.length < 20 && !busyBtn) busyBtn = el;
+            
+            // 如果是正常购买按钮
+            if (buyTextReg.test(t)) {
+                if (el.offsetParent !== null) {
+                    normalBtn = el;
+                    break; // 找到可见的正常按钮，直接返回
+                }
+            }
         }
+        
+        // 正常按钮优先
+        if (normalBtn) return normalBtn;
+        
         // 第三优先：Max 卡片区域内的任意按钮
         for (const card of document.querySelectorAll('[class*="card"],[class*="plan"],[class*="tier"],[class*="product"]')) {
             const ct = card.textContent.toLowerCase();
@@ -1080,7 +1180,14 @@
                 if (btn.offsetParent !== null || window.getComputedStyle(btn).position === 'fixed') return btn;
             }
         }
-        return busyBtn; // 最后返回"人数过多"按钮（会被 forceClickButton 解除 disabled）
+        
+        // 最后返回"人数过多"按钮（会被 forceClickButton 解除 disabled）
+        if (busyBtn) {
+            log('找到人数过多按钮: "' + busyBtn.textContent.trim() + '"，将强制点击');
+            return busyBtn;
+        }
+        
+        return null;
     }
 
     // 直接调用页面 TencentCaptcha 进行验证
@@ -1275,7 +1382,16 @@
     function stopAll() {
         stopRequested = true;
         setState({ proactive: false, status: 'idle', count: 0, wafCooldownUntil: 0 });
-        if (state.timerId) { clearInterval(state.timerId); setState({ timerId: null }); }
+        if (state.timerId) {
+            // 新的定时器结构使用 cancel 方法
+            if (typeof state.timerId.cancel === 'function') {
+                state.timerId.cancel();
+            } else {
+                // 兼容旧的 setInterval ID
+                clearInterval(state.timerId);
+            }
+            setState({ timerId: null });
+        }
         log('已停止 (WAF冷却已清除)');
     }
 
@@ -1285,9 +1401,13 @@
     let serverTimeOffset = 0;
 
     async function syncServerTime() {
+        // 方案 1：使用 HEAD 请求获取服务器时间，避免产生业务副作用
         try {
             const t0 = Date.now();
-            const resp = await _fetch(location.origin + '/api/biz/pay/check?bizId=sync', { credentials: 'include' }).catch(() => null);
+            const resp = await _fetch(location.origin + '/api/biz/pay/preview', { 
+                method: 'HEAD', 
+                credentials: 'include' 
+            }).catch(() => null);
             const t1 = Date.now();
             const rtt = t1 - t0;
 
@@ -1299,14 +1419,25 @@
             }
         } catch {}
 
+        // 方案 2：备用时间源 - worldtimeapi
         try {
             const resp = await fetch('https://worldtimeapi.org/api/timezone/Asia/Shanghai');
             const data = await resp.json();
             serverTimeOffset = new Date(data.datetime).getTime() - Date.now();
-            log('时间同步(备用): 偏差 ' + (serverTimeOffset > 0 ? '+' : '') + serverTimeOffset + 'ms');
-        } catch {
-            log('时间同步失败, 使用本地时钟');
-        }
+            log('时间同步(备用1): 偏差 ' + (serverTimeOffset > 0 ? '+' : '') + serverTimeOffset + 'ms');
+            return;
+        } catch {}
+
+        // 方案 3：另一个备用时间源 - timeapi.io
+        try {
+            const resp = await fetch('https://timeapi.io/api/time/current/zone?timeZone=Asia/Shanghai');
+            const data = await resp.json();
+            serverTimeOffset = new Date(data.dateTime).getTime() - Date.now();
+            log('时间同步(备用2): 偏差 ' + (serverTimeOffset > 0 ? '+' : '') + serverTimeOffset + 'ms');
+            return;
+        } catch {}
+
+        log('时间同步失败, 使用本地时钟', 'warn');
     }
 
     function getServerNow() {
@@ -1338,7 +1469,15 @@
     }
 
     function scheduleAt(timeStr) {
-        if (state.timerId) { clearInterval(state.timerId); setState({ timerId: null }); }
+        if (state.timerId) {
+            // 兼容新旧定时器结构
+            if (typeof state.timerId.cancel === 'function') {
+                state.timerId.cancel();
+            } else {
+                clearInterval(state.timerId);
+            }
+            setState({ timerId: null });
+        }
         const parts = timeStr.split(':').map(Number);
         if (parts.length < 2 || parts[0] > 23 || parts[1] > 59) { log('时间格式错误'); return; }
 
@@ -1365,23 +1504,32 @@
             }, Math.max(0, ms - 3000));
         }
 
-        const tid = setInterval(() => {
+        // 优化：使用递归 setTimeout 替代 setInterval，减少 CPU 占用
+        let timerCancelled = false;
+        const checkTimer = () => {
+            if (timerCancelled) return;
             const remaining = target.getTime() - getServerNow();
             if (remaining > 0 && remaining < 60000) {
                 const timerEl = _shadowRef?.getElementById('timer-info');
                 if (timerEl) timerEl.textContent = '-' + Math.ceil(remaining / 1000) + 's';
             }
             if (remaining <= 0) {
-                clearInterval(tid);
                 setState({ timerId: null });
                 const timerEl = _shadowRef?.getElementById('timer-info');
                 if (timerEl) timerEl.textContent = '';
                 log('时间到! 自动启动抢购!');
                 startProactive();
+            } else {
+                // 动态调整检查间隔：大于 10 秒时每 500ms 检查，小于 10 秒时每 50ms 检查
+                const nextCheck = remaining > 10000 ? 500 : 50;
+                setTimeout(checkTimer, nextCheck);
             }
-        }, 100);
-
-        setState({ timerId: tid });
+        };
+        
+        // 保存取消函数到 state.timerId
+        const timerId = { cancel: () => { timerCancelled = true; } };
+        setState({ timerId });
+        checkTimer();
     }
 
     async function preheat() {
@@ -1422,13 +1570,17 @@
     ];
 
     function patchVueServerBusy() {
-        // 持续 patch，每200ms检查一次
+        // 优化：使用 MutationObserver 监听 DOM 变化，只在按钮状态变化时触发 patch
         let stopped = false;
-        const tid = setInterval(() => {
+        let patchTimer = null;
+        
+        // 执行实际的 patch 操作
+        const doPatch = () => {
             if (stopped) return;
             const app = document.querySelector('#app');
             const vue = app && (app.__vue__ || app.__vue_app__);
             if (!vue) return;
+            
             let patched = 0;
             const walk = (vm, depth) => {
                 if (depth > 12) return;
@@ -1459,24 +1611,62 @@
             };
             walk(vue, 0);
             if (patched > 0) log('已解除 busy 状态 (' + patched + '个字段)', 'info');
-        }, 200);
-
-        // MutationObserver: 监听 #app 是否被替换 (SPA 导航)
+        };
+        
+        // 防抖：500ms 内多次 DOM 变化只触发一次 patch
+        const schedulePatch = () => {
+            if (patchTimer) clearTimeout(patchTimer);
+            patchTimer = setTimeout(doPatch, 500);
+        };
+        
+        // 初始执行一次
+        doPatch();
+        
+        // 使用 MutationObserver 监听 #app 内的 DOM 变化
         const appEl = document.querySelector('#app');
-        if (appEl && appEl.parentNode) {
+        if (appEl) {
             const mo = new MutationObserver((mutations) => {
+                if (stopped) return;
+                // 只在按钮相关属性变化时触发 patch
                 for (const m of mutations) {
-                    for (const node of (m.removedNodes || [])) {
-                        if (node === appEl || (node.contains && node.contains(appEl))) {
-                            stopped = true;
-                            clearInterval(tid);
-                            mo.disconnect();
-                            return;
-                        }
+                    if (m.type === 'attributes' && (
+                        m.attributeName?.includes('disabled') ||
+                        m.attributeName?.includes('busy') ||
+                        m.attributeName?.includes('sold')
+                    )) {
+                        schedulePatch();
+                        return;
+                    }
+                    if (m.type === 'childList') {
+                        schedulePatch();
+                        return;
                     }
                 }
             });
-            mo.observe(appEl.parentNode, { childList: true });
+            mo.observe(appEl, { 
+                childList: true, 
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['disabled', 'class', 'style']
+            });
+            
+            // SPA 导航时清理
+            if (appEl.parentNode) {
+                const navMo = new MutationObserver((mutations) => {
+                    for (const m of mutations) {
+                        for (const node of (m.removedNodes || [])) {
+                            if (node === appEl || (node.contains && node.contains(appEl))) {
+                                stopped = true;
+                                if (patchTimer) clearTimeout(patchTimer);
+                                mo.disconnect();
+                                navMo.disconnect();
+                                return;
+                            }
+                        }
+                    }
+                });
+                navMo.observe(appEl.parentNode, { childList: true });
+            }
         }
     }
 
@@ -1551,7 +1741,7 @@
 .keys{font-size:10px;color:#636e72;text-align:center;margin-top:6px}
 </style>
 <div class="panel">
-  <div class="hd" id="drag"><b>GLM v5.0 AUTO</b><button class="mn" id="min">-</button></div>
+   <div class="hd" id="drag"><b>GLM v1.2.0 AUTO</b><button class="mn" id="min">-</button></div>
   <div class="bd" id="bd">
     <div class="st st-idle" id="st">等待中 (自动捕获)</div>
     <div class="cap" id="cap">${state.captured ? '已捕获: ' + (state.captured.productId || '手动') : '页面加载后自动捕获...'}</div>
@@ -1627,7 +1817,7 @@
             }).catch(() => {});
         }
 
-        log('v5.0 已加载 (自动捕获 + 极速并发)');
+        log('v1.2.0 已加载 (自动捕获 + 极速并发 + 性能优化)');
         if (state.captured) log('已恢复上次捕获: ' + (state.captured.productName || state.captured.productId || '手动'));
 
         setupDialogWatcher();
@@ -1717,7 +1907,7 @@
     // ═══════════════════════════════════════════
     //  启动
     // ═══════════════════════════════════════════
-    console.log('[GLM Rush Plus] v1.0.0 已注入 (真实触发版)');
+    console.log('[GLM Rush Plus] v1.2.0 已注入 (性能优化版)');
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', createPanel);
     } else {
